@@ -44,6 +44,8 @@ class MainScreenViewModel(private val application: Application) : ViewModel() {
         private set
     var transcribedNote by mutableStateOf<Note?>(null)
         private set
+    var userMessage by mutableStateOf<String?>(null)
+        private set
 
     private val modelsPath = File(application.filesDir, "models")
     private val samplesPath = File(application.filesDir, "samples")
@@ -73,7 +75,8 @@ class MainScreenViewModel(private val application: Application) : ViewModel() {
         try {
             copyAssets()
             loadBaseModel()
-            canTranscribe = true
+            canTranscribe = whisperContext != null
+            if (!canTranscribe) userMessage = "Whisper model is missing. Recording will be saved, but transcription is unavailable."
         } catch (e: Exception) {
             Log.w(LOG_TAG, e)
         }
@@ -136,10 +139,12 @@ class MainScreenViewModel(private val application: Application) : ViewModel() {
         mediaPlayer?.start()
     }
 
-    private suspend fun transcribeAudio(file: File) {
-        if (!canTranscribe) {
+    private suspend fun transcribeAudio(file: File, existingNote: Note? = null) {
+        if (whisperContext == null) {
+            userMessage = "Recording saved. Whisper model is not installed, so transcription could not start."
             return
         }
+        if (!canTranscribe) return
 
         canTranscribe = false
         isProcessing = true
@@ -154,16 +159,22 @@ class MainScreenViewModel(private val application: Application) : ViewModel() {
 
             // Save note to database and set it to transcribedNote
             if (!text.isNullOrBlank()) {
-                val note = saveNote(text, file.absolutePath, audioDuration.toLong())
-                withContext(Dispatchers.Main) {
-                    transcribedNote = note
-                }
+                val note = if (existingNote != null) {
+                    val embedding = textEmbedding.embed(text)
+                    val updated = existingNote.copy(transcribedText = text, duration = audioDuration.toLong(), embedding = embedding?.let { textEmbedding.embeddingToJson(it) })
+                    noteDao.updateNote(updated)
+                    updated
+                } else saveNote(text, file.absolutePath, audioDuration.toLong())
+                withContext(Dispatchers.Main) { transcribedNote = note; userMessage = null }
+            } else {
+                userMessage = "Recording saved, but Whisper returned no transcription. You can retry later."
             }
         } catch (e: Exception) {
-            Log.w(LOG_TAG, e)
+            Log.e(LOG_TAG, "Transcription failed", e)
+            userMessage = "Recording saved. Transcription failed: ${e.message ?: "unknown error"}"
         }
 
-        canTranscribe = true
+        canTranscribe = whisperContext != null
         isProcessing = false
     }
 
@@ -193,7 +204,16 @@ class MainScreenViewModel(private val application: Application) : ViewModel() {
             if (isRecording) {
                 recorder.stopRecording()
                 isRecording = false
-                recordedFile?.let { transcribeAudio(it) }
+                recordedFile?.let { file ->
+                    if (file.exists() && file.length() > 44L) {
+                        val saved = saveNote("", file.absolutePath, recordingDuration)
+                        if (saved != null) {
+                            transcribedNote = saved
+                            userMessage = "Recording saved. Starting transcription…"
+                            transcribeAudio(file, saved)
+                        } else userMessage = "Could not save the recording note."
+                    } else userMessage = "Recording failed: no audio data was written."
+                }
             } else {
                 stopPlayback()
                 transcribedNote = null
